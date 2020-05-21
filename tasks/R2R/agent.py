@@ -13,9 +13,11 @@ import torch.distributions as D
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
-import transformers as ppb
+
 from env import R2RBatch
 from utils import padding_idx
+import math
+from datetime import datetime 
 
 class BaseAgent(object):
     ''' Base class for an R2R agent to generate and save trajectories. '''
@@ -144,14 +146,14 @@ class Seq2SeqAgent(BaseAgent):
 
     def __init__(self, env, results_path, encoder, decoder, episode_len=20):
         super(Seq2SeqAgent, self).__init__(env, results_path)
-        model_class, tokenizer_class, pretrained_weights = (ppb.BertModel, ppb.BertTokenizer, 'bert-base-uncased')
-        self.bert_tokenizer = tokenizer_class.from_pretrained(pretrained_weights)
-        self.bert_model = model_class.from_pretrained(pretrained_weights)
         self.encoder = encoder
         self.decoder = decoder
         self.episode_len = episode_len
         self.losses = []
         self.criterion = nn.CrossEntropyLoss(ignore_index = self.model_actions.index('<ignore>'))
+        self.image_feature_path = '/egr/research-hlr/joslin/room2room/pretrained_npy/'
+        self.image_cache = {}
+        
 
     @staticmethod
     def n_inputs():
@@ -182,42 +184,13 @@ class Seq2SeqAgent(BaseAgent):
                list(seq_lengths), list(perm_idx)
 
     def _config_batch(self, obs):
-        features = []
-        padded_masks = []
-        largest_config_num = max([ob['configuration_num'] for ob in obs])
+        batch_configurations = []
+        configuration_num = []
+        start = 0
         for ob in obs:
-            tokenized = list(map(lambda x: self.bert_tokenizer.encode(x, add_special_tokens=True), ob['configuration']))
-            
-            max_len = 0
-            for i in tokenized:
-                if len(i) > max_len:
-                    max_len = len(i)
-            padded = torch.tensor([i + [0]*(max_len-len(i)) for i in tokenized])
-            attention_mask = torch.where(padded != 0,  torch.ones_like(padded), torch.zeros_like(padded))
-
-            with torch.no_grad():
-                last_hidden_states = self.bert_model(padded, attention_mask=attention_mask)
-            config_num * 768
-            feature = last_hidden_states[0][:,0,:]
-            feature_size = feature.shape[0]
-
-            while len(feature) < largest_config_num:
-            # largest_config_num * 768
-               feature = torch.cat((feature,torch.zeros(1, feature.shape[1])), dim=0)
-            # largest_config_num
-            padded_mask = torch.zeros(largest_config_num)
-            padded_mask[:feature_size] = 1
-    
-            features.append(feature)
-            padded_masks.append(padded_mask)
-        # batch_size * largest_config_num *768
-        features = torch.stack(features, dim=0)
-        # barch_size * 1
-        padded_masks = torch.stack(padded_masks, dim=0)
-        
-        return Variable(features, requires_grad=False).long().cuda(), \
-               padded_masks.byte().cuda()
-
+            batch_configurations += ob['configuration']
+            configuration_num.append(ob['configuration_num'])
+        return batch_configurations, configuration_num
     
     def _feature_variable(self, obs):
         ''' Extract precomputed features into variable. '''
@@ -226,6 +199,40 @@ class Seq2SeqAgent(BaseAgent):
         for i,ob in enumerate(obs):
             features[i,:] = ob['feature']
         return Variable(torch.from_numpy(features), requires_grad=False).cuda()
+    
+    def load_image_features(self, scan_id):
+        if len(self.image_cache) > 20:
+            delete_key = random.choice(list(self.image_cache))
+            if delete_key != scan_id:
+                del self.image_cache[delete_key]
+        if scan_id not in self.image_cache:
+            self.image_cache[scan_id] = np.load(self.image_feature_path + scan_id + ".npy")
+        return self.image_cache[scan_id]
+
+    
+    def _faster_rcnn_feature(self, obs):
+        a=datetime.now() 
+        image_features_list = [] 
+        for strid, each_ob in enumerate(obs):
+            headings = []
+            features = []
+            all_image_feature = self.load_image_features(each_ob['scan'])
+            temp = int(round((each_ob['heading']*180/math.pi)/5) * 5)
+            for _ in range(0,12):          
+                if temp >=  360:
+                    temp = temp - 360      
+                features.append(torch.from_numpy(all_image_feature.item().get(each_ob['viewpoint'])[temp*math.pi/180]['features']))
+                temp += 30
+            features = torch.cat(features, dim=0)
+            image_features_list.append(features)
+            print('Finish ', str(strid))
+        image_features = torch.stack(image_features_list, dim=0)
+
+        b=datetime.now() 
+        print((b-a).seconds)
+        return image_features
+
+
 
     def _teacher_action(self, obs, ended):
         ''' Extract teacher actions into variable. '''
@@ -253,8 +260,7 @@ class Seq2SeqAgent(BaseAgent):
         obs = np.array(self.env.reset())
         batch_size = len(obs)
 
-        # Reorder the language input for the encoder
-        seq, seq_mask = self._config_batch(obs)
+        batch_configurations, configuration_num_list = self._config_batch(obs)
 
         # Record starting point
         traj = [{
@@ -263,7 +269,6 @@ class Seq2SeqAgent(BaseAgent):
         } for ob in obs]
 
         # Select the first configuration
-        c_a = self.encoder(seq)
 
         # # Initial action
         # a_t = Variable(torch.ones(batch_size).long() * self.model_actions.index('<start>'),
@@ -273,9 +278,12 @@ class Seq2SeqAgent(BaseAgent):
         # # Do a sequence rollout and calculate the loss
         # self.loss = 0
         # env_action = [None] * batch_size
-        # for t in range(self.episode_len):
+        for t in range(self.episode_len):
+            config_embedding = self.encoder(batch_configurations, configuration_num_list)
+            image_embedding = self._faster_rcnn_feature(obs)
 
-        #     f_t = self._feature_variable(perm_obs) # Image features from obs
+        #     f_t = self.encoder # Image features from obs
+
         #     h_t,c_t,alpha,logit = self.decoder(a_t.view(-1, 1), f_t, h_t, c_t, ctx, seq_mask)
         #     # Mask outputs where agent can't move forward
         #     for i,ob in enumerate(perm_obs):
